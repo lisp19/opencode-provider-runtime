@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "opencode-provider-runtime-server",
+  "version": "0.1.0",
+  "description": "OpenCode server-side host for a separated provider runtime.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./server": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "engines": {
+    "opencode": ">=1.15.5"
+  }
+}
