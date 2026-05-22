@@ -7,6 +7,11 @@ const OVERRIDE_OPTION = "__opencodeProviderRuntime"
 const RUNTIME_DUMMY_KEY = "opencode-provider-runtime-dummy-key"
 const LOG_DIR = path.join(os.homedir(), ".config", "opencode", "logs")
 const LOG_PATH = path.join(LOG_DIR, "provider-client.log")
+const GLOBAL_FETCH_STATE = {
+  installed: false,
+  originalFetch: globalThis.fetch,
+  route: undefined,
+}
 
 async function log(enabled, event, detail) {
   if (!enabled) return
@@ -78,6 +83,17 @@ function toHeaderObject(headers) {
   return Object.fromEntries(headers.entries())
 }
 
+function requestURL(input) {
+  return new URL(input instanceof URL ? input.href : typeof input === "string" ? input : input.url)
+}
+
+function isModelForwardRequest(url) {
+  if (url.hostname === "api.openai.com") {
+    return /^\/v\d+(?:(?:alpha|beta)\d*)?(?=\/|$)/.test(url.pathname) || url.pathname.startsWith("/chat/completions")
+  }
+  return url.hostname === "chatgpt.com" && url.pathname === "/backend-api/codex/responses"
+}
+
 function isOauthRequest(options) {
   return options.apiKey === RUNTIME_DUMMY_KEY
 }
@@ -100,8 +116,22 @@ function createRedirectFetch(baseURL, baseFetch, debug) {
   }
 }
 
+function installGlobalRedirectFetch(redirectFetch) {
+  GLOBAL_FETCH_STATE.route = redirectFetch
+  if (GLOBAL_FETCH_STATE.installed) return
+  GLOBAL_FETCH_STATE.installed = true
+  globalThis.fetch = async (requestInput, init) => {
+    const route = GLOBAL_FETCH_STATE.route
+    if (!route) return GLOBAL_FETCH_STATE.originalFetch(requestInput, init)
+    try {
+      if (isModelForwardRequest(requestURL(requestInput))) return route(requestInput, init)
+    } catch {}
+    return GLOBAL_FETCH_STATE.originalFetch(requestInput, init)
+  }
+}
+
 async function runtimeOauthRequest(runtime, requestInput, init, debug) {
-  const original = new URL(requestInput instanceof URL ? requestInput.href : typeof requestInput === "string" ? requestInput : requestInput.url)
+  const original = requestURL(requestInput)
   const headers = toHeaders(requestInput, init?.headers)
   const runtimeHeaders = new Headers({
     "content-type": "application/json",
@@ -153,18 +183,11 @@ function composeFetch(options) {
   }
 
   if (!override.baseURL) return baseFetch
-  const redirectFetch = createRedirectFetch(override.baseURL, fetch, debug)
+  const redirectFetch = createRedirectFetch(override.baseURL, GLOBAL_FETCH_STATE.originalFetch, debug)
   if (!options.fetch) return redirectFetch
+  installGlobalRedirectFetch(redirectFetch)
 
-  return async (requestInput, init) => {
-    const previousFetch = globalThis.fetch
-    globalThis.fetch = async (innerInput, innerInit) => redirectFetch(innerInput, innerInit)
-    try {
-      return await baseFetch(requestInput, init)
-    } finally {
-      globalThis.fetch = previousFetch
-    }
-  }
+  return async (requestInput, init) => baseFetch(requestInput, init)
 }
 
 export function createOpenAIRedirect(options = {}) {
