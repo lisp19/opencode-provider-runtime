@@ -1,0 +1,36 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "file:///absolute/path/to/provider-client",
+      {
+        "log": true,
+        "debug": true,
+        "providers": {
+          "openai": {
+            // Detached OpenAI provider runtime.
+            "runtime": {
+              "url": "https://your-proxy.example.com/runtime",
+              "auth": {
+                "header": "X-Runtime-Auth",
+                "secret": "REPLACE_WITH_SHARED_SECRET"
+              },
+              "headers": {
+                "X-Proxy-Token": "REPLACE_WITH_PROXY_TOKEN",
+                "X-Provider": "openai-oauth"
+              }
+            }
+          },
+          "google": {
+            // Fill in the override URL before testing baseURL routing.
+            "baseURL": "https://your-proxy.example.com",
+            "headers": {
+              "X-Proxy-Token": "REPLACE_WITH_PROXY_TOKEN",
+              "X-Provider": "gemini"
+            }
+          }
+        }
+      }
+    ]
+  ]
+}
