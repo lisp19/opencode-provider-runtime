@@ -1,11 +1,8 @@
 import { createServer } from "node:http"
 import os from "node:os"
-import { readFile, writeFile } from "node:fs/promises"
+import { buildOpenAIHeaders, getOpenAIOAuth } from "./openai-oauth.js"
 
-const ISSUER = "https://auth.openai.com"
 const CODEX_API_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
-const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-const AUTH_PATH = `${os.homedir()}/.local/share/opencode/auth.json`
 const DEFAULT_CLIENT_VERSION = "0.0.0"
 const DEFAULT_BASE_INSTRUCTIONS =
   "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals."
@@ -71,81 +68,6 @@ function sendError(res, error) {
   sendJson(res, 500, { error: "internal_error" })
 }
 
-async function loadAuth() {
-  const raw = JSON.parse(await readFile(AUTH_PATH, "utf8"))
-  return raw.openai
-}
-
-function parseJwtClaims(token) {
-  const parts = token.split(".")
-  if (parts.length !== 3) return undefined
-  try {
-    return JSON.parse(Buffer.from(parts[1], "base64url").toString())
-  } catch {
-    return undefined
-  }
-}
-
-function extractAccountIdFromClaims(claims) {
-  return claims.chatgpt_account_id || claims["https://api.openai.com/auth"]?.chatgpt_account_id || claims.organizations?.[0]?.id
-}
-
-function extractAccountId(tokens) {
-  if (tokens.id_token) {
-    const claims = parseJwtClaims(tokens.id_token)
-    const accountId = claims && extractAccountIdFromClaims(claims)
-    if (accountId) return accountId
-  }
-  if (tokens.access_token) {
-    const claims = parseJwtClaims(tokens.access_token)
-    return claims ? extractAccountIdFromClaims(claims) : undefined
-  }
-}
-
-async function saveAuth(auth) {
-  const raw = JSON.parse(await readFile(AUTH_PATH, "utf8"))
-  raw.openai = auth
-  await writeFile(AUTH_PATH, JSON.stringify(raw, null, 2), { mode: 0o600 })
-}
-
-async function refreshAccessToken(refreshToken) {
-  const response = await fetch(`${ISSUER}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: CLIENT_ID,
-    }).toString(),
-  })
-  if (!response.ok) throw new Error(`Token refresh failed: ${response.status}`)
-  return response.json()
-}
-
-async function getOpenAIOAuth() {
-  const auth = await loadAuth()
-  if (!auth || auth.type !== "oauth") throw new Error("Remote openai oauth auth not found")
-  if (auth.access && auth.expires > Date.now()) return auth
-  const tokens = await refreshAccessToken(auth.refresh)
-  const next = {
-    type: "oauth",
-    refresh: tokens.refresh_token,
-    access: tokens.access_token,
-    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-    accountId: extractAccountId(tokens) || auth.accountId,
-  }
-  await saveAuth(next)
-  return next
-}
-
-function buildHeaders(auth, withContentType = true) {
-  const headers = new Headers()
-  headers.set("authorization", `Bearer ${auth.access}`)
-  if (withContentType) headers.set("content-type", "application/json")
-  if (auth.accountId) headers.set("ChatGPT-Account-Id", auth.accountId)
-  return headers
-}
-
 function resolveConfiguredURL(template) {
   return template
     .replaceAll("${HOME_URLENCODED}", encodeURIComponent(os.homedir()))
@@ -167,7 +89,7 @@ function bearerToken(req) {
 
 function authorizeResponses(req, providerOptions) {
   const runtimeAuth = providerOptions?.runtime_auth
-  if (!runtimeAuth) return true
+  if (!runtimeAuth) return false
   if (bearerToken(req) === runtimeAuth.secret) return true
   const actual = getHeaderValue(req.headers, runtimeAuth.header)
   return typeof actual === "string" && actual === runtimeAuth.secret
@@ -381,7 +303,7 @@ async function fetchOfficialCodexModels(providerOptions, clientVersion, options,
     const auth = await getOpenAIOAuth()
     const upstreamURL = new URL(providerOptions.codex_responses.upstream_models_url)
     upstreamURL.searchParams.set("client_version", clientVersion || DEFAULT_CLIENT_VERSION)
-    const response = await fetch(upstreamURL, { method: "GET", headers: buildHeaders(auth, false) })
+    const response = await fetch(upstreamURL, { method: "GET", headers: buildOpenAIHeaders(auth, false) })
     if (!response.ok) {
       await log(options.logEnabled, "responses.models.templates.failed", { status: response.status, url: upstreamURL.href })
       return []
@@ -432,18 +354,36 @@ async function handleModels(url, res, options, log) {
   sendJson(res, 200, body)
 }
 
-async function handleResponses(res, reqBody, options, log) {
+async function handleResponses(req, res, reqBody, options, log) {
   const auth = await getOpenAIOAuth()
-  const upstream = await fetch(CODEX_API_ENDPOINT, {
-    method: "POST",
-    headers: buildHeaders(auth, true),
-    body: reqBody,
-  })
-  await log(options.logEnabled, "responses.upstream.response", {
-    status: upstream.status,
-    contentType: upstream.headers.get("content-type"),
-  })
-  await pipeUpstreamResponse(upstream, res, "text/event-stream")
+  const abortController = new AbortController()
+  const abortUpstream = () => abortController.abort()
+  req.once("aborted", abortUpstream)
+  res.once("close", abortUpstream)
+  try {
+    try {
+      const upstream = await fetch(CODEX_API_ENDPOINT, {
+        method: "POST",
+        headers: buildOpenAIHeaders(auth, true),
+        body: reqBody,
+        signal: abortController.signal,
+      })
+      await log(options.logEnabled, "responses.upstream.response", {
+        status: upstream.status,
+        contentType: upstream.headers.get("content-type"),
+      })
+      try {
+        await pipeUpstreamResponse(upstream, res, "text/event-stream")
+      } catch (error) {
+        if (!(abortController.signal.aborted && res.destroyed)) throw error
+      }
+    } catch (error) {
+      if (!(abortController.signal.aborted && (req.destroyed || res.destroyed))) throw error
+    }
+  } finally {
+    req.off("aborted", abortUpstream)
+    res.off("close", abortUpstream)
+  }
 }
 
 async function handleRequest(req, res, options, log) {
@@ -474,7 +414,7 @@ async function handleRequest(req, res, options, log) {
       return
     }
     await log(options.logEnabled, "responses.request.received", { path: pathname })
-    await handleResponses(res, await readBody(req), options, log)
+    await handleResponses(req, res, await readBody(req), options, log)
     return
   }
 

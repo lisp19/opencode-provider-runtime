@@ -13,6 +13,7 @@
   "files": [
     "index.js",
     "codex-responses.js",
+    "openai-oauth.js",
     "README.md"
   ],
   "engines": {

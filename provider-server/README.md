@@ -45,6 +45,8 @@ Plugin options:
 }
 ```
 
+`providers.openai.runtime_auth` is required. If it is missing, the server refuses to start.
+
 If `providers.openai.runtime_auth` is configured, the runtime server requires the matching header on incoming `POST /runtime` requests and returns `401` when it is missing or invalid.
 
 The plugin exposes:
@@ -64,6 +66,8 @@ The new Codex-facing endpoints are independent of `/runtime` and use the standar
 
 - `POST /responses` and `POST /v1/responses` proxy directly to ChatGPT Codex responses.
 - `GET /models` and `GET /v1/models` read the server's authenticated OpenCode provider view in real time, then map that provider data into the Codex `ModelsResponse` format.
+
+`providers.openai.codex_responses.provider_source_url` defaults to the local OpenCode server on port `4096`. Override it when your OpenCode server listens on a different port.
 
 If `providers.openai.runtime_auth` is configured, the new endpoints accept either:
 

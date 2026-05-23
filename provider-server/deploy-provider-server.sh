@@ -3,6 +3,8 @@ set -euo pipefail
 
 runtime_port="${RUNTIME_PORT:-3456}"
 runtime_bind_host="${RUNTIME_BIND_HOST:-0.0.0.0}"
+responses_port="${RESPONSES_PORT:-3455}"
+responses_bind_host="${RESPONSES_BIND_HOST:-0.0.0.0}"
 opencode_server_port="${OPENCODE_SERVER_PORT:-4096}"
 runtime_auth_header="${RUNTIME_AUTH_HEADER:-X-Runtime-Auth}"
 runtime_auth_secret="${RUNTIME_AUTH_SECRET:?RUNTIME_AUTH_SECRET must be set}"
@@ -42,6 +44,8 @@ cat > "$remote_config_path" <<EOF
       {
         "port": $runtime_port,
         "hostname": "$runtime_bind_host",
+        "responses_port": $responses_port,
+        "responses_hostname": "$responses_bind_host",
         "log": true,
         "providers": {
           "openai": {
@@ -49,6 +53,9 @@ cat > "$remote_config_path" <<EOF
             "runtime_auth": {
               "header": "$runtime_auth_header",
               "secret": "$runtime_auth_secret"
+            },
+            "codex_responses": {
+              "provider_source_url": "http://127.0.0.1:$opencode_server_port/provider?directory=${DOLLAR}{HOME_URLENCODED}"
             }
           }
         }

@@ -1,16 +1,14 @@
 import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
+import { appendFile, mkdir } from "node:fs/promises"
 import { createCodexResponsesServer } from "./codex-responses.js"
+import { buildOpenAIHeaders, getOpenAIOAuth } from "./openai-oauth.js"
 
 const PLUGIN_ID = "provider-server"
-const ISSUER = "https://auth.openai.com"
 const CODEX_API_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
-const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const LOG_DIR = path.join(os.homedir(), ".config", "opencode", "logs")
 const LOG_PATH = path.join(LOG_DIR, `${PLUGIN_ID}.log`)
-const AUTH_PATH = path.join(os.homedir(), ".local", "share", "opencode", "auth.json")
 
 let httpServer
 let responsesHttpServer
@@ -43,8 +41,13 @@ function parseOptions(options) {
 }
 
 function parseProviders(value) {
-  if (!isRecord(value)) return { openai: { mode: "oauth" } }
-  return Object.fromEntries(Object.entries(value).map(([provider, config]) => [provider, parseProvider(provider, config)]))
+  const providers = !isRecord(value)
+    ? { openai: parseProvider("openai", { mode: "oauth" }) }
+    : Object.fromEntries(Object.entries(value).map(([provider, config]) => [provider, parseProvider(provider, config)]))
+  if (!providers.openai?.runtime_auth) {
+    throw new Error("providers.openai.runtime_auth is required")
+  }
+  return providers
 }
 
 function parseProvider(provider, value) {
@@ -100,114 +103,64 @@ async function readBody(req) {
   return Buffer.concat(chunks).toString("utf8")
 }
 
+function resolveConfiguredURL(template) {
+  return template
+    .replaceAll("${HOME_URLENCODED}", encodeURIComponent(os.homedir()))
+    .replaceAll("${HOME}", os.homedir())
+}
+
 function sendJson(res, status, body) {
   res.writeHead(status, { "content-type": "application/json" })
   res.end(JSON.stringify(body))
 }
 
-async function loadAuth() {
-  const raw = JSON.parse(await readFile(AUTH_PATH, "utf8"))
-  return raw.openai
-}
-
-function parseJwtClaims(token) {
-  const parts = token.split(".")
-  if (parts.length !== 3) return undefined
-  try {
-    return JSON.parse(Buffer.from(parts[1], "base64url").toString())
-  } catch {
-    return undefined
-  }
-}
-
-function extractAccountIdFromClaims(claims) {
-  return claims.chatgpt_account_id || claims["https://api.openai.com/auth"]?.chatgpt_account_id || claims.organizations?.[0]?.id
-}
-
-function extractAccountId(tokens) {
-  if (tokens.id_token) {
-    const claims = parseJwtClaims(tokens.id_token)
-    const accountId = claims && extractAccountIdFromClaims(claims)
-    if (accountId) return accountId
-  }
-  if (tokens.access_token) {
-    const claims = parseJwtClaims(tokens.access_token)
-    return claims ? extractAccountIdFromClaims(claims) : undefined
-  }
-}
-
-async function saveAuth(auth) {
-  const raw = JSON.parse(await readFile(AUTH_PATH, "utf8"))
-  raw.openai = auth
-  await writeFile(AUTH_PATH, JSON.stringify(raw, null, 2), { mode: 0o600 })
-}
-
-async function refreshAccessToken(refreshToken) {
-  const response = await fetch(`${ISSUER}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: CLIENT_ID,
-    }).toString(),
-  })
-  if (!response.ok) throw new Error(`Token refresh failed: ${response.status}`)
-  return response.json()
-}
-
-async function getOpenAIOAuth() {
-  const auth = await loadAuth()
-  if (!auth || auth.type !== "oauth") throw new Error("Remote openai oauth auth not found")
-  if (auth.access && auth.expires > Date.now()) return auth
-  const tokens = await refreshAccessToken(auth.refresh)
-  const next = {
-    type: "oauth",
-    refresh: tokens.refresh_token,
-    access: tokens.access_token,
-    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-    accountId: extractAccountId(tokens) || auth.accountId,
-  }
-  await saveAuth(next)
-  return next
-}
-
-function buildHeaders(auth) {
-  const headers = new Headers()
-  headers.set("authorization", `Bearer ${auth.access}`)
-  headers.set("content-type", "application/json")
-  if (auth.accountId) headers.set("ChatGPT-Account-Id", auth.accountId)
-  return headers
-}
-
-async function handleOpenAIRuntime(reqBody, res, options) {
+async function handleOpenAIRuntime(req, reqBody, res, options) {
   const auth = await getOpenAIOAuth()
-  const upstream = await fetch(CODEX_API_ENDPOINT, {
-    method: reqBody.request?.method ?? "POST",
-    headers: buildHeaders(auth),
-    body: typeof reqBody.request?.body === "string" ? reqBody.request.body : JSON.stringify(reqBody.request?.body ?? {}),
-  })
-  await log(options.logEnabled, "runtime.upstream.response", {
-    status: upstream.status,
-    contentType: upstream.headers.get("content-type"),
-  })
-  res.writeHead(upstream.status, {
-    "content-type": upstream.headers.get("content-type") ?? "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-  })
-  if (!upstream.body) {
-    res.end()
-    return
+  const abortController = new AbortController()
+  const abortUpstream = () => abortController.abort()
+  req.once("aborted", abortUpstream)
+  res.once("close", abortUpstream)
+  try {
+    try {
+      const upstream = await fetch(CODEX_API_ENDPOINT, {
+        method: reqBody.request?.method ?? "POST",
+        headers: buildOpenAIHeaders(auth),
+        body: typeof reqBody.request?.body === "string" ? reqBody.request.body : JSON.stringify(reqBody.request?.body ?? {}),
+        signal: abortController.signal,
+      })
+      await log(options.logEnabled, "runtime.upstream.response", {
+        status: upstream.status,
+        contentType: upstream.headers.get("content-type"),
+      })
+      res.writeHead(upstream.status, {
+        "content-type": upstream.headers.get("content-type") ?? "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      })
+      if (!upstream.body) {
+        res.end()
+        return
+      }
+      try {
+        for await (const chunk of upstream.body) {
+          if (res.destroyed) break
+          res.write(chunk)
+        }
+      } catch (error) {
+        if (!(abortController.signal.aborted && res.destroyed)) throw error
+      }
+    } catch (error) {
+      if (!(abortController.signal.aborted && (req.destroyed || res.destroyed))) throw error
+    }
+    if (!res.writableEnded && !res.destroyed) res.end()
+  } finally {
+    req.off("aborted", abortUpstream)
+    res.off("close", abortUpstream)
   }
-  for await (const chunk of upstream.body) {
-    res.write(chunk)
-  }
-  res.end()
 }
 
-async function handleOpenAIModels(res) {
-  const response = await fetch(`http://127.0.0.1:4096/provider?directory=${encodeURIComponent(os.homedir())}`)
+async function handleOpenAIModels(res, providerSourceURL) {
+  const response = await fetch(resolveConfiguredURL(providerSourceURL))
   if (!response.ok) {
     sendJson(res, response.status, { error: "provider_list_failed" })
     return
@@ -230,7 +183,7 @@ function isSupportedOpenAIProviderMode(payload) {
 
 function authorizeRuntime(req, providerOptions) {
   const runtimeAuth = providerOptions?.runtime_auth
-  if (!runtimeAuth) return true
+  if (!runtimeAuth) return false
   const actual = req.headers[runtimeAuth.header.toLowerCase()]
   return typeof actual === "string" && actual === runtimeAuth.secret
 }
@@ -265,10 +218,10 @@ async function handleRequest(req, res, options) {
     return
   }
   if (payload.mode === "models") {
-    await handleOpenAIModels(res)
+    await handleOpenAIModels(res, options.providers.openai.codex_responses.provider_source_url)
     return
   }
-  await handleOpenAIRuntime(payload, res, options)
+  await handleOpenAIRuntime(req, payload, res, options)
 }
 
 export default {

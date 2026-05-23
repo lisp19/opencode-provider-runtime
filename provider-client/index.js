@@ -188,9 +188,33 @@ async function runtimeModels(runtime) {
 }
 
 const runtimeInstructions = new Map()
+const RUNTIME_INSTRUCTION_TTL_MS = 5 * 60 * 1000
 
 function runtimeInstructionKey(sessionID, providerID) {
   return `${sessionID}:${providerID}`
+}
+
+function pruneStaleInstructions(now) {
+  for (const [key, entry] of runtimeInstructions.entries()) {
+    if (entry.expiresAt <= now) {
+      runtimeInstructions.delete(key)
+    }
+  }
+}
+
+function storeRuntimeInstructions(sessionID, providerID, instructions) {
+  const now = Date.now()
+  pruneStaleInstructions(now)
+  const key = runtimeInstructionKey(sessionID, providerID)
+  runtimeInstructions.set(key, { instructions, expiresAt: now + RUNTIME_INSTRUCTION_TTL_MS })
+}
+
+function takeRuntimeInstructions(sessionID, providerID) {
+  pruneStaleInstructions(Date.now())
+  const key = runtimeInstructionKey(sessionID, providerID)
+  const entry = runtimeInstructions.get(key)
+  runtimeInstructions.delete(key)
+  return entry?.instructions
 }
 
 function normalizePathname(pathname) {
@@ -367,7 +391,10 @@ const plugin = {
         if (input.model.providerID !== "openai") return
         if (!input.sessionID) return
 
-        runtimeInstructions.set(runtimeInstructionKey(input.sessionID, input.model.providerID), output.system.join("\n"))
+        const instructions = output.system.join("\n")
+        if (!instructions) return
+
+        storeRuntimeInstructions(input.sessionID, input.model.providerID, instructions)
         output.system.length = 0
       },
       async "chat.params"(input, output) {
@@ -375,12 +402,10 @@ const plugin = {
         if (!override?.runtime) return
         if (input.model.providerID !== "openai") return
 
-        const key = runtimeInstructionKey(input.sessionID, input.model.providerID)
-        const instructions = runtimeInstructions.get(key)
+        const instructions = takeRuntimeInstructions(input.sessionID, input.model.providerID)
         if (!instructions) return
 
         output.options.instructions = instructions
-        runtimeInstructions.delete(key)
       },
       provider: {
         id: "openai",

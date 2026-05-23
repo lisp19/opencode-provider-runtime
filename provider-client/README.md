@@ -130,8 +130,11 @@ When `debug: true` is enabled, the plugin writes:
 
 - `request.rewrite.started`
 - `request.rewrite.completed`
+- `request.rewrite.final`
+- `request.runtime.started`
+- `request.runtime.completed`
 
-Those entries include request method, original URL path, rewritten URL path, query parameter names, and response status. Query parameter values and header values are not logged.
+Those entries can include full outbound headers and serialized request bodies for the rewritten or detached-runtime request path.
 
 Interpretation:
 
@@ -151,8 +154,8 @@ Example log output:
 
 Safety rules:
 
-- header values are never written to logs
-- query parameter values are never written to logs
+- `debug: true` is not recommended in production
+- treat debug logs as sensitive because they can include full header values and request payloads
 
 ## Multiple Providers
 
