@@ -1,0 +1,14 @@
+model_provider = "opencode-openai"
+model = "gpt-5.5"
+
+[model_providers.opencode-openai]
+name = "OpenCode OpenAI"
+base_url = "https://your-proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+http_headers = { "X-Proxy-Token" = "REPLACE_WITH_PROXY_TOKEN", "X-Provider" = "openai-oauth" }
+
+[model_providers.opencode-openai.auth]
+command = "/bin/sh"
+args = ["-lc", "printf '%s' 'REPLACE_WITH_SHARED_SECRET'"]

@@ -2,6 +2,7 @@ import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
+import { createCodexResponsesServer } from "./codex-responses.js"
 
 const PLUGIN_ID = "provider-server"
 const ISSUER = "https://auth.openai.com"
@@ -12,6 +13,9 @@ const LOG_PATH = path.join(LOG_DIR, `${PLUGIN_ID}.log`)
 const AUTH_PATH = path.join(os.homedir(), ".local", "share", "opencode", "auth.json")
 
 let httpServer
+let responsesHttpServer
+
+const DEFAULT_BUNDLED_OPENAI_SLUGS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2", "codex-auto-review"]
 
 async function log(enabled, event, detail) {
   if (!enabled) return
@@ -30,9 +34,12 @@ function parseOptions(options) {
   const value = isRecord(options) ? options : {}
   const port = typeof value.port === "number" ? value.port : 3456
   const hostname = typeof value.hostname === "string" && value.hostname.trim() ? value.hostname.trim() : "0.0.0.0"
+  const responsesPort = typeof value.responses_port === "number" ? value.responses_port : 3455
+  const responsesHostname =
+    typeof value.responses_hostname === "string" && value.responses_hostname.trim() ? value.responses_hostname.trim() : "0.0.0.0"
   const logEnabled = value.log === true
   const providers = parseProviders(value.providers)
-  return { port, hostname, logEnabled, providers }
+  return { port, hostname, responsesPort, responsesHostname, logEnabled, providers }
 }
 
 function parseProviders(value) {
@@ -43,9 +50,37 @@ function parseProviders(value) {
 function parseProvider(provider, value) {
   const config = isRecord(value) ? value : {}
   const runtimeAuth = parseRuntimeAuth(provider, config.runtime_auth)
+  const codexResponses = parseCodexResponses(config.codex_responses)
   return {
     ...config,
     runtime_auth: runtimeAuth,
+    codex_responses: codexResponses,
+  }
+}
+
+function parseCodexResponses(value) {
+  if (value === undefined) {
+    return {
+      enabled: true,
+      provider_source_url: `http://127.0.0.1:4096/provider?directory=${encodeURIComponent(os.homedir())}`,
+      upstream_models_url: "https://chatgpt.com/backend-api/codex/models",
+      bundled_openai_slugs: DEFAULT_BUNDLED_OPENAI_SLUGS,
+    }
+  }
+  if (!isRecord(value)) throw new Error("providers.openai.codex_responses must be an object")
+  return {
+    enabled: value.enabled !== false,
+    provider_source_url:
+      typeof value.provider_source_url === "string" && value.provider_source_url.trim()
+        ? value.provider_source_url.trim()
+        : `http://127.0.0.1:4096/provider?directory=${encodeURIComponent(os.homedir())}`,
+    upstream_models_url:
+      typeof value.upstream_models_url === "string" && value.upstream_models_url.trim()
+        ? value.upstream_models_url.trim()
+        : "https://chatgpt.com/backend-api/codex/models",
+    bundled_openai_slugs: Array.isArray(value.bundled_openai_slugs)
+      ? value.bundled_openai_slugs.filter((item) => typeof item === "string" && item.trim())
+      : DEFAULT_BUNDLED_OPENAI_SLUGS,
   }
 }
 
@@ -256,6 +291,28 @@ export default {
         port: options.port,
         path: "/runtime",
       })
+    }
+    if (!responsesHttpServer && options.providers.openai?.codex_responses?.enabled !== false) {
+      const server = createCodexResponsesServer(options, log)
+      try {
+        await new Promise((resolve, reject) => {
+          server.once("error", reject)
+          server.listen(options.responsesPort, options.responsesHostname, resolve)
+        })
+        responsesHttpServer = server
+        await log(options.logEnabled, "responses.server.started", {
+          hostname: options.responsesHostname,
+          port: options.responsesPort,
+          paths: ["/responses", "/v1/responses", "/models", "/v1/models"],
+        })
+      } catch (error) {
+        server.close()
+        await log(options.logEnabled, "responses.server.failed", {
+          hostname: options.responsesHostname,
+          port: options.responsesPort,
+          message: error instanceof Error ? error.message : String(error),
+        })
+      }
     }
     return {}
   },
